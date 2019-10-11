@@ -6,59 +6,16 @@
 # DDR4: 1600 MT/s
 
 import math
-from collections import OrderedDict
 
 from migen import *
 from migen.genlib.misc import BitSlip, WaitTimer
 
 from litex.soc.interconnect.csr import *
 
-from litedram.common import PhySettings
+from litedram.common import *
 from litedram.phy.dfi import *
 
-
-def get_cl_cw(memtype, tck):
-    f_to_cl_cwl = OrderedDict()
-    if memtype == "DDR3":
-        f_to_cl_cwl[800e6]  = ( 6, 5)
-        f_to_cl_cwl[1066e6] = ( 7, 6)
-        f_to_cl_cwl[1333e6] = (10, 7)
-        f_to_cl_cwl[1600e6] = (11, 8)
-    elif memtype == "DDR4":
-        f_to_cl_cwl[1600e6] = (11,  9)
-    else:
-        raise ValueError
-    for f, (cl, cwl) in f_to_cl_cwl.items():
-        if tck >= 2/f:
-            return cl, cwl
-    raise ValueError
-
-def get_sys_latency(nphases, cas_latency):
-    return math.ceil(cas_latency/nphases)
-
-def get_sys_phases(nphases, sys_latency, cas_latency):
-    dat_phase = sys_latency*nphases - cas_latency
-    cmd_phase = (dat_phase - 1)%nphases
-    return cmd_phase, dat_phase
-
-
-class DDR4DFIMux(Module):
-    def __init__(self, dfi_i, dfi_o):
-        for i in range(len(dfi_i.phases)):
-            p_i = dfi_i.phases[i]
-            p_o = dfi_o.phases[i]
-            self.comb += [
-                p_i.connect(p_o),
-                If(~p_i.ras_n & p_i.cas_n & p_i.we_n,
-                   p_o.act_n.eq(0),
-                   p_o.we_n.eq(p_i.address[14]),
-                   p_o.cas_n.eq(p_i.address[15]),
-                   p_o.ras_n.eq(p_i.address[16])
-                ).Else(
-                    p_o.act_n.eq(1),
-                )
-            ]
-
+# Xilinx Ultrascale DDR3/DDR4 PHY ------------------------------------------------------------------
 
 class USDDRPHY(Module, AutoCSR):
     def __init__(self, pads, memtype="DDR3", sys_clk_freq=100e6, iodelay_clk_freq=200e6, cmd_latency=0):
@@ -67,18 +24,20 @@ class USDDRPHY(Module, AutoCSR):
         if memtype == "DDR4":
             addressbits += 3 # cas_n/ras_n/we_n multiplexed with address
         bankbits = len(pads.ba) if memtype == "DDR3" else len(pads.ba) + len(pads.bg)
-        nranks = 1 if not hasattr(pads, "cs_n") else len(pads.cs_n)
+        nranks   = 1 if not hasattr(pads, "cs_n") else len(pads.cs_n)
         databits = len(pads.dq)
-        nphases = 4
+        nphases  = 4
+        assert databits%8 == 0
 
         if hasattr(pads, "ten"):
             self.comb += pads.ten.eq(0)
 
+        # Registers --------------------------------------------------------------------------------
         self._en_vtc = CSRStorage(reset=1)
 
         self._half_sys8x_taps = CSRStatus(9)
 
-        self._wlevel_en = CSRStorage()
+        self._wlevel_en     = CSRStorage()
         self._wlevel_strobe = CSR()
 
         self._cdly_rst = CSR()
@@ -86,51 +45,49 @@ class USDDRPHY(Module, AutoCSR):
 
         self._dly_sel = CSRStorage(databits//8)
 
-        self._rdly_dq_rst = CSR()
-        self._rdly_dq_inc = CSR()
+        self._rdly_dq_rst         = CSR()
+        self._rdly_dq_inc         = CSR()
         self._rdly_dq_bitslip_rst = CSR()
-        self._rdly_dq_bitslip = CSR()
+        self._rdly_dq_bitslip     = CSR()
 
-        self._wdly_dq_rst = CSR()
-        self._wdly_dq_inc = CSR()
+        self._wdly_dq_rst  = CSR()
+        self._wdly_dq_inc  = CSR()
         self._wdly_dqs_rst = CSR()
         self._wdly_dqs_inc = CSR()
 
-        # compute phy settings
-        cl, cwl = get_cl_cw(memtype, tck)
-        cwl = cwl + cmd_latency
-        cl_sys_latency = get_sys_latency(nphases, cl)
+        # PHY settings -----------------------------------------------------------------------------
+        cl, cwl         = get_cl_cw(memtype, tck)
+        cwl             = cwl + cmd_latency
+        cl_sys_latency  = get_sys_latency(nphases, cl)
         cwl_sys_latency = get_sys_latency(nphases, cwl)
 
         rdcmdphase, rdphase = get_sys_phases(nphases, cl_sys_latency, cl)
         wrcmdphase, wrphase = get_sys_phases(nphases, cwl_sys_latency, cwl)
         self.settings = PhySettings(
-            memtype=memtype,
-            databits=databits,
-            dfi_databits=2*databits,
-            nranks=nranks,
-            nphases=nphases,
-            rdphase=rdphase,
-            wrphase=wrphase,
-            rdcmdphase=rdcmdphase,
-            wrcmdphase=wrcmdphase,
-            cl=cl,
-            cwl=cwl - cmd_latency,
-            read_latency=2 + cl_sys_latency + 1 + 3,
-            write_latency=cwl_sys_latency
+            memtype       = memtype,
+            databits      = databits,
+            dfi_databits  = 2*databits,
+            nranks        = nranks,
+            nphases       = nphases,
+            rdphase       = rdphase,
+            wrphase       = wrphase,
+            rdcmdphase    = rdcmdphase,
+            wrcmdphase    = wrcmdphase,
+            cl            = cl,
+            cwl           = cwl - cmd_latency,
+            read_latency  = 2 + cl_sys_latency + 1 + 3,
+            write_latency = cwl_sys_latency
         )
 
-        self.dfi = Interface(addressbits, bankbits, nranks, 2*databits, nphases)
-        if memtype == "DDR3":
-            _dfi = self.dfi
-        else:
-            _dfi = Interface(addressbits, bankbits, nranks, 2*databits, nphases)
-            dfi_mux = DDR4DFIMux(self.dfi, _dfi)
-            self.submodules += dfi_mux
+        # DFI Interface ----------------------------------------------------------------------------
+        self.dfi = dfi = Interface(addressbits, bankbits, nranks, 2*databits, nphases)
+        if memtype == "DDR4":
+            dfi = Interface(addressbits, bankbits, nranks, 2*databits, nphases)
+            self.submodules += DDR4DFIMux(self.dfi, dfi)
 
         # # #
 
-        # Clock
+        # Clock ------------------------------------------------------------------------------------
         clk_o_nodelay = Signal()
         clk_o_delayed = Signal()
         self.specials += [
@@ -161,7 +118,7 @@ class USDDRPHY(Module, AutoCSR):
             )
         ]
 
-        # Addresses and commands
+        # Addresses and Commands -------------------------------------------------------------------
         for i in range(addressbits if memtype=="DDR3" else addressbits-3):
             a_o_nodelay = Signal()
             self.specials += [
@@ -172,10 +129,10 @@ class USDDRPHY(Module, AutoCSR):
                     o_OQ=a_o_nodelay,
                     i_RST=ResetSignal(),
                     i_CLK=ClockSignal("sys4x"), i_CLKDIV=ClockSignal(),
-                    i_D=Cat(_dfi.phases[0].address[i], _dfi.phases[0].address[i],
-                            _dfi.phases[1].address[i], _dfi.phases[1].address[i],
-                            _dfi.phases[2].address[i], _dfi.phases[2].address[i],
-                            _dfi.phases[3].address[i], _dfi.phases[3].address[i])
+                    i_D=Cat(dfi.phases[0].address[i], dfi.phases[0].address[i],
+                            dfi.phases[1].address[i], dfi.phases[1].address[i],
+                            dfi.phases[2].address[i], dfi.phases[2].address[i],
+                            dfi.phases[3].address[i], dfi.phases[3].address[i])
                 ),
                 Instance("ODELAYE3",
                     p_CASCADE="NONE", p_UPDATE_MODE="ASYNC", p_REFCLK_FREQUENCY=iodelay_clk_freq/1e6,
@@ -206,10 +163,10 @@ class USDDRPHY(Module, AutoCSR):
                     o_OQ=ba_o_nodelay,
                     i_RST=ResetSignal(),
                     i_CLK=ClockSignal("sys4x"), i_CLKDIV=ClockSignal(),
-                    i_D=Cat(_dfi.phases[0].bank[i], _dfi.phases[0].bank[i],
-                            _dfi.phases[1].bank[i], _dfi.phases[1].bank[i],
-                            _dfi.phases[2].bank[i], _dfi.phases[2].bank[i],
-                            _dfi.phases[3].bank[i], _dfi.phases[3].bank[i])
+                    i_D=Cat(dfi.phases[0].bank[i], dfi.phases[0].bank[i],
+                            dfi.phases[1].bank[i], dfi.phases[1].bank[i],
+                            dfi.phases[2].bank[i], dfi.phases[2].bank[i],
+                            dfi.phases[3].bank[i], dfi.phases[3].bank[i])
                 ),
                 Instance("ODELAYE3",
                     p_CASCADE="NONE", p_UPDATE_MODE="ASYNC", p_REFCLK_FREQUENCY=iodelay_clk_freq/1e6,
@@ -241,10 +198,10 @@ class USDDRPHY(Module, AutoCSR):
                     o_OQ=x_o_nodelay,
                     i_RST=ResetSignal(),
                     i_CLK=ClockSignal("sys4x"), i_CLKDIV=ClockSignal(),
-                    i_D=Cat(getattr(_dfi.phases[0], name), getattr(_dfi.phases[0], name),
-                            getattr(_dfi.phases[1], name), getattr(_dfi.phases[1], name),
-                            getattr(_dfi.phases[2], name), getattr(_dfi.phases[2], name),
-                            getattr(_dfi.phases[3], name), getattr(_dfi.phases[3], name))
+                    i_D=Cat(getattr(dfi.phases[0], name), getattr(dfi.phases[0], name),
+                            getattr(dfi.phases[1], name), getattr(dfi.phases[1], name),
+                            getattr(dfi.phases[2], name), getattr(dfi.phases[2], name),
+                            getattr(dfi.phases[3], name), getattr(dfi.phases[3], name))
                 ),
                 Instance("ODELAYE3",
                     p_CASCADE="NONE", p_UPDATE_MODE="ASYNC", p_REFCLK_FREQUENCY=iodelay_clk_freq/1e6,
@@ -259,7 +216,7 @@ class USDDRPHY(Module, AutoCSR):
                 )
             ]
 
-        # DQS and DM
+        # DQS and DM -------------------------------------------------------------------------------
         oe_dqs = Signal()
         dqs_serdes_pattern = Signal(8)
         self.comb += \
@@ -282,10 +239,10 @@ class USDDRPHY(Module, AutoCSR):
                     o_OQ=dm_o_nodelay,
                     i_RST=ResetSignal(),
                     i_CLK=ClockSignal("sys4x"), i_CLKDIV=ClockSignal(),
-                    i_D=Cat(_dfi.phases[0].wrdata_mask[i], _dfi.phases[0].wrdata_mask[databits//8+i],
-                            _dfi.phases[1].wrdata_mask[i], _dfi.phases[1].wrdata_mask[databits//8+i],
-                            _dfi.phases[2].wrdata_mask[i], _dfi.phases[2].wrdata_mask[databits//8+i],
-                            _dfi.phases[3].wrdata_mask[i], _dfi.phases[3].wrdata_mask[databits//8+i])
+                    i_D=Cat(dfi.phases[0].wrdata_mask[i], dfi.phases[0].wrdata_mask[databits//8+i],
+                            dfi.phases[1].wrdata_mask[i], dfi.phases[1].wrdata_mask[databits//8+i],
+                            dfi.phases[2].wrdata_mask[i], dfi.phases[2].wrdata_mask[databits//8+i],
+                            dfi.phases[3].wrdata_mask[i], dfi.phases[3].wrdata_mask[databits//8+i])
                 )
             self.specials += \
                 Instance("ODELAYE3",
@@ -305,8 +262,7 @@ class USDDRPHY(Module, AutoCSR):
             dqs_delayed = Signal()
             dqs_t = Signal()
             if i == 0:
-                # Store initial DQS DELAY_VALUE (in taps) to
-                # be able to reload DELAY_VALUE after reset.
+                # Store initial DQS DELAY_VALUE (in taps) to be able to reload DELAY_VALUE after reset.
                 dqs_taps = Signal(9)
                 dqs_taps_timer = WaitTimer(2**16)
                 self.submodules += dqs_taps_timer
@@ -350,7 +306,7 @@ class USDDRPHY(Module, AutoCSR):
                 )
             ]
 
-        # DQ
+        # DQ ---------------------------------------------------------------------------------------
         oe_dq = Signal()
         for i in range(databits):
             dq_o_nodelay = Signal()
@@ -376,10 +332,10 @@ class USDDRPHY(Module, AutoCSR):
                     o_OQ=dq_o_nodelay, o_T_OUT=dq_t,
                     i_RST=ResetSignal(),
                     i_CLK=ClockSignal("sys4x"), i_CLKDIV=ClockSignal(),
-                    i_D=Cat(_dfi.phases[0].wrdata[i], _dfi.phases[0].wrdata[databits+i],
-                            _dfi.phases[1].wrdata[i], _dfi.phases[1].wrdata[databits+i],
-                            _dfi.phases[2].wrdata[i], _dfi.phases[2].wrdata[databits+i],
-                            _dfi.phases[3].wrdata[i], _dfi.phases[3].wrdata[databits+i]),
+                    i_D=Cat(dfi.phases[0].wrdata[i], dfi.phases[0].wrdata[databits+i],
+                            dfi.phases[1].wrdata[i], dfi.phases[1].wrdata[databits+i],
+                            dfi.phases[2].wrdata[i], dfi.phases[2].wrdata[databits+i],
+                            dfi.phases[3].wrdata[i], dfi.phases[3].wrdata[databits+i]),
                     i_T=~oe_dq
                 ),
                 Instance("ISERDESE3",
@@ -426,37 +382,37 @@ class USDDRPHY(Module, AutoCSR):
                 )
             ]
             self.comb += [
-                _dfi.phases[0].rddata[i].eq(dq_bitslip.o[0]),
-                _dfi.phases[1].rddata[i].eq(dq_bitslip.o[2]),
-                _dfi.phases[2].rddata[i].eq(dq_bitslip.o[4]),
-                _dfi.phases[3].rddata[i].eq(dq_bitslip.o[6]),
+                dfi.phases[0].rddata[i].eq(dq_bitslip.o[0]),
+                dfi.phases[1].rddata[i].eq(dq_bitslip.o[2]),
+                dfi.phases[2].rddata[i].eq(dq_bitslip.o[4]),
+                dfi.phases[3].rddata[i].eq(dq_bitslip.o[6]),
 
-                _dfi.phases[0].rddata[databits+i].eq(dq_bitslip.o[1]),
-                _dfi.phases[1].rddata[databits+i].eq(dq_bitslip.o[3]),
-                _dfi.phases[2].rddata[databits+i].eq(dq_bitslip.o[5]),
-                _dfi.phases[3].rddata[databits+i].eq(dq_bitslip.o[7]),
+                dfi.phases[0].rddata[databits+i].eq(dq_bitslip.o[1]),
+                dfi.phases[1].rddata[databits+i].eq(dq_bitslip.o[3]),
+                dfi.phases[2].rddata[databits+i].eq(dq_bitslip.o[5]),
+                dfi.phases[3].rddata[databits+i].eq(dq_bitslip.o[7]),
             ]
 
-        # Flow control
+        # Flow control -----------------------------------------------------------------------------
         #
         # total read latency:
         #  2 cycles through OSERDESE2
         #  cl_sys_latency cycles CAS
         #  2 cycles through ISERDESE2
         #  3 cycles through Bitslip
-        rddata_en = _dfi.phases[self.settings.rdphase].rddata_en
+        rddata_en = dfi.phases[self.settings.rdphase].rddata_en
         for i in range(self.settings.read_latency-1):
             n_rddata_en = Signal()
             self.sync += n_rddata_en.eq(rddata_en)
             rddata_en = n_rddata_en
-        for phase in _dfi.phases:
+        for phase in dfi.phases:
             phase_rddata_valid = Signal()
             self.sync += phase_rddata_valid.eq(rddata_en | self._wlevel_en.storage)
             self.comb += phase.rddata_valid.eq(phase_rddata_valid)
 
         oe = Signal()
         last_wrdata_en = Signal(cwl_sys_latency+2)
-        wrphase = _dfi.phases[self.settings.wrphase]
+        wrphase = dfi.phases[self.settings.wrphase]
         self.sync += last_wrdata_en.eq(Cat(wrphase.wrdata_en, last_wrdata_en[:-1]))
         self.comb += oe.eq(
             last_wrdata_en[cwl_sys_latency-1] |

@@ -248,9 +248,22 @@ class LiteDRAMCore(SoCSDRAM):
     def __init__(self, platform, core_config, **kwargs):
         platform.add_extension(get_common_ios())
         sys_clk_freq = core_config["sys_clk_freq"]
+        cpu_type     = core_config["cpu"]
+        csr_expose   = core_config.get("csr_expose", False)
+        csr_align    = core_config.get("csr_align", 32)
+        if cpu_type is None:
+            kwargs["integrated_rom_size"]  = 0
+            kwargs["integrated_sram_size"] = 0
+            kwargs["l2_size"]              = 0
+            kwargs["with_uart"]            = False
+            kwargs["with_timer"]           = False
+            kwargs["with_ctrl"]            = False
+            kwargs["with_wishbone"]        = (cpu_type != None)
+        else:
+           kwargs["l2_size"] = 0
         SoCSDRAM.__init__(self, platform, sys_clk_freq,
-            cpu_type=core_config["cpu"],
-            l2_size=16*core_config["sdram_module_nb"],
+            cpu_type=cpu_type,
+            csr_alignment=csr_align,
             **kwargs)
 
         # crg
@@ -289,8 +302,10 @@ class LiteDRAMCore(SoCSDRAM):
         ]
 
         # CSR port
-        if core_config.get("expose_csr_port", "no") == "yes":
-            csr_port = csr_bus.Interface(self.csr_address_width, self.csr_data_width)
+        if csr_expose:
+            csr_port = csr_bus.Interface(
+                address_width=self.csr_address_width,
+                data_width=self.csr_data_width)
             self.add_csr_master(csr_port)
             platform.add_extension(get_csr_ios(self.csr_address_width,
                                                self.csr_data_width))
@@ -301,6 +316,9 @@ class LiteDRAMCore(SoCSDRAM):
                 csr_port.dat_w.eq(_csr_port_io.dat_w),
                 _csr_port_io.dat_r.eq(csr_port.dat_r),
             ]
+            if self.cpu_type == None:
+                csr_base = core_config.get("csr_base", 0)
+                self.shadow_base = csr_base;
 
         # user port
         self.comb += [
@@ -422,6 +440,10 @@ def main():
 
     # Convert YAML elements to Python/LiteX
     for k, v in core_config.items():
+        replaces = {"False": False, "True": True, "None": None}
+        for r in replaces.keys():
+            if v == r:
+                core_config[k] = replaces[r]
         if "clk_freq" in k:
             core_config[k] = float(core_config[k])
         if k == "sdram_module":
@@ -448,9 +470,10 @@ def main():
         with open(filename, 'w') as file:
             file.write(filedata)
 
-    init_filename = "mem.init"
-    os.system("mv build/gateware/{} build/gateware/litedram_core.init".format(init_filename))
-    replace_in_file("build/gateware/litedram_core.v", init_filename, "litedram_core.init")
+    if soc.cpu_type is not None:
+        init_filename = "mem.init"
+        os.system("mv build/gateware/{} build/gateware/litedram_core.init".format(init_filename))
+        replace_in_file("build/gateware/litedram_core.v", init_filename, "litedram_core.init")
 
 if __name__ == "__main__":
     main()
